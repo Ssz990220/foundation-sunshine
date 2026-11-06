@@ -4230,6 +4230,9 @@ namespace stream {
       session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
 
     if (session->config.audio.codec == audio::CODEC_MAT_LIVE) {
+      // The normal capture loop raises its own priority. Live MAT bypasses
+      // that loop, so give its source/broadcast handoff the same priority.
+      platf::adjust_thread_priority(platf::thread_priority_e::critical);
       auto shutdown = session->mail->event<bool>(mail::shutdown);
       auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
       uint64_t submitted = 0;

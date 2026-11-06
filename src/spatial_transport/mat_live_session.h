@@ -107,21 +107,13 @@ namespace spatial_transport {
         "Live MAT source descriptor/sequence/clock");
       spatial_audio::validate_carrier(frame.bytes);
       require(cycles < uint64_t(INT64_MAX) / 20000000, "Live MAT cycle counter overflow");
-      // Pace each cycle from the moment its frame is available. The source runs
-      // on the audio device clock; a fixed host-clock origin would accumulate
-      // drift until the deadline check fails, or let a faster source back up
-      // the pipe. A queued frame starts immediately, so backlog drains.
-      const auto cycle_start = Clock::now();
+      // Match the normal audio path: capture owns the clock, and the existing
+      // bounded broadcast/FEC queue owns packet delivery. A second 60-wakeup
+      // fragment clock adds per-cycle overhead and eventually backs up live
+      // capture. Never sleep or rebase a media clock between these fragments.
       frame.epoch = session.profile.epoch;
       frame.domain = session.profile.domain;
-      unsigned index = 0;
       fragment(frame, [&](const uint8_t *data, size_t) {
-        auto target = cycle_start + std::chrono::microseconds(uint64_t(index++) * 20000 / MAT_WIRE_FRAGMENTS);
-        while (Clock::now() < target) {
-          require(!cancelled(), "Live MAT cancelled");
-          wait(target - Clock::now());
-        }
-        require(Clock::now() - target < std::chrono::milliseconds(60), "Live MAT missed deadline; no burst recovery");
         send(data);
       });
       hash = mat_hash_update(hash, frame.bytes.data(), frame.bytes.size());

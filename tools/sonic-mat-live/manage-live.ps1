@@ -36,15 +36,28 @@ if($Action -in @('Status','Stop')){
  $status=Get-State $state
  if($Action -eq 'Status'){$status|ConvertTo-Json;return}
  if($status.publisherAlive){
-  $process=Get-Process -Id $state.publisherPid
+  $process=Get-Process -Id $state.publisherPid -ErrorAction SilentlyContinue
+  if($process){
   if(!(Same-Process $process $state.publisherCreated $state.producer)){throw 'Publisher changed before stop'}
-  $stopSignal=[Threading.EventWaitHandle]::OpenExisting($state.stopEvent)
-  try{[void]$stopSignal.Set()}finally{$stopSignal.Dispose()}
+  $stopSignal=$null
+  try {
+   try {$stopSignal=[Threading.EventWaitHandle]::OpenExisting($state.stopEvent)}
+   catch {
+    # The publisher can exit between the identity check and event open. Only
+    # its actual exit makes a missing event safe; a live process stays an error.
+    if(!$process.WaitForExit(1000)){throw 'Stop event missing for live pinned publisher; no force kill/unload'}
+   }
+   if($stopSignal){[void]$stopSignal.Set()}
+  } finally {if($stopSignal){$stopSignal.Dispose()}}
   if(!$process.WaitForExit(15000)){throw 'Native stop exceeded 15 seconds; no force kill/unload; inspect capture log'}
+  }
  }
  $status=Get-State $state
+ $status.cleanupVerified=!$status.publisherAlive -and (!$status.engineIdentityRetained -or $status.hooksRestored)
  $status|ConvertTo-Json
- if($status.state -ne 'StoppedVerified'){throw 'Capture stop/restoration not verified; inspect original log'}
+ # A failed capture can still have restored every hook. Preserve Faulted while
+ # reporting that cleanup separately, rather than treating failure as success.
+ if(!$status.cleanupVerified){throw 'Capture stop/restoration not verified; inspect original log'}
  return
 }
 if(!$Build -or !$EnginePid -or !$EngineCreated){throw 'Reviewed build and exact engine PID/creation FILETIME are required'}
@@ -57,12 +70,26 @@ Assert-MatBuildArtifacts $buildRoot $manifest
 $trusted=@{}
 foreach($name in @('sunshine-plugin-mat-capture.exe','sunshine-plugin-object-tap.dll','sunshine-sonic-mat-worker.dll')){$trusted[$name]=Get-MatTrustedHash $manifest $name}
 function Invoke-Preflight([string]$Image){
- $result=& $Image --preflight $EnginePid $EngineCreated 2>&1
- if($LASTEXITCODE -eq 3){
+ # Explicit redirected streams avoid PowerShell native-pipeline encoding
+ # failures in SSH/non-console hosts. Arguments are fixed numeric identities.
+ $start=[Diagnostics.ProcessStartInfo]::new()
+ $start.FileName=$Image;$start.Arguments="--preflight $EnginePid $EngineCreated"
+ $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+ $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+ $start.StandardOutputEncoding=[Text.Encoding]::UTF8;$start.StandardErrorEncoding=[Text.Encoding]::UTF8
+ $child=[Diagnostics.Process]::new();$child.StartInfo=$start
+ try {
+  if(!$child.Start()){throw 'Read-only preflight could not start'}
+  $stdout=$child.StandardOutput.ReadToEndAsync();$stderr=$child.StandardError.ReadToEndAsync()
+  if(!$child.WaitForExit(10000)){throw 'Read-only preflight timed out; no attach attempted'}
+  $code=$child.ExitCode
+  $result=@(($stdout.GetAwaiter().GetResult()+"`n"+$stderr.GetAwaiter().GetResult()) -split "`r?`n"|Where-Object {$_})
+ } finally {$child.Dispose()}
+ if($code -eq 3){
   $components=(@($result)|Where-Object {"$_" -like 'COMPONENT *'}) -join "`n"
   throw "This Windows audio engine or Dolby Access build has not been verified for MAT capture; no attach/elevation attempted. Include these lines when reporting it:`n$components"
  }
- if($LASTEXITCODE){throw "Read-only plugin preflight failed; no attach/elevation attempted: $result"}
+ if($code){throw "Read-only plugin preflight failed; no attach/elevation attempted: $result"}
  return $result
 }
 if($Action -eq 'Preflight'){Invoke-Preflight (Join-Path $buildRoot sunshine-plugin-mat-capture.exe);return}
@@ -78,7 +105,7 @@ Initialize-MatDeploymentDirectory $deployment
 $deployed=@{}
 foreach($name in @('sunshine-plugin-mat-capture.exe','sunshine-plugin-object-tap.dll','sunshine-sonic-mat-worker.dll')){
  $from=Join-Path $buildRoot $name;$hash=$trusted[$name]
- $targetName=if($name.EndsWith('.dll')){[IO.Path]::GetFileNameWithoutExtension($name)+'-'+$hash.Substring(0,16)+'.dll'}else{$name}
+ $targetName=if($name.EndsWith('.dll')){[IO.Path]::GetFileNameWithoutExtension($name)+'-'+$hash.Substring(0,16)+'-'+$exeHash.Substring(0,16)+'.dll'}else{$name}
  $to=Join-Path $deployment $targetName
  if(Test-Path -LiteralPath $to){Assert-MatDeploymentEntry $to}
  Copy-MatDeploymentFile $from $to $hash

@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "stream_output_protocol.h"
 #include "mat_compat.h"
+#include "mat_pacing.h"
 #include <roapi.h>
 #include <activation.h>
 #include <winstring.h>
@@ -57,6 +58,11 @@ struct Session {
       if (h) CloseHandle(h);
   }
 };
+static bool
+failed(Session &s, Failure why) {
+  if (s.out->failure == Failure::none) s.out->failure = why;
+  return false;
+}
 static GUID
 guid(const wchar_t *p) {
   GUID g {};
@@ -255,7 +261,7 @@ submit(Session &s, const Call &c) {
   s.expected = &c;
   s.out->submitHr = s.submit(s.target, s.stream, &p, c.pcm, 480, 1.f);
   s.expected = nullptr;
-  if (s.out->submitHr != S_OK) return false;
+  if (s.out->submitHr != S_OK) return failed(s, Failure::submit);
   ++s.out->submissions;
   return true;
 }
@@ -271,22 +277,28 @@ waitUntil(Session &s, HANDLE timer, int64_t target) {
   }
 }
 static bool
-process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, uint32_t source) {
+process(Session &s, HANDLE timer, EncoderClock &clock, uint32_t phase, uint32_t source, int64_t captured = 0) {
   auto &o = *s.out;
-  if (o.processes >= UINT32_MAX - 100) return false;
+  if (o.processes >= UINT32_MAX - 100) return failed(s, Failure::sourceCounter);
   if (!s.fake || s.config.paceMs) {
-    auto now = qpc();
-    if (!started || now - next > hz() / 500) {
-      next = now;
-      started = true;
-    }
-    if (!waitUntil(s, timer, next)) return false;
-    next += hz() / 100;
+    const auto frequency = hz();
+    const auto now = qpc();
+    int64_t next = 0;
+    if (!clock.deadline(now, frequency, phase, captured, next)) return failed(s, Failure::captureClock);
+    const bool bootstrap = phase == 2 && !clock.source_settled();
+    const bool allowed = clock.within_budget(now, frequency, phase, next);
+    if ((!bootstrap || !allowed) && now - next > o.maximumLatenessQpc) o.maximumLatenessQpc = now - next;
+    // Catch up after bounded scheduling jitter, without dropping input or
+    // resetting the clock. A suspended/stalled pipeline still fails closed.
+    if (!allowed) return failed(s, Failure::pace);
+    if (!waitUntil(s, timer, next)) return failed(s, Failure::interruptedWait);
   }
   UINT32 produced = 0;
   o.processHr = s.process(s.target, request, s.fake ? nullptr : s.scratch, &produced);
   auto end = qpc();
-  if (o.processHr != S_OK || produced > request || (!s.fake && produced != request)) return false;
+  o.lastProduced = produced;
+  if (o.processHr != S_OK) return failed(s, Failure::processResult);
+  if (produced > request || (!s.fake && produced != request)) return failed(s, Failure::processBytes);
   Block b {};
   b.phase = phase;
   b.sampleStart = o.processes * 480;
@@ -311,10 +323,9 @@ process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, 
     b.bytes = static_cast<uint32_t>(p - s.transcript);
     data = s.transcript;
   }
-  // Only the dedicated codec worker may wait. Native budget is 20ms. The
-  // explicitly unpaced FAKE fixture allows 1s for disk diagnostic scheduling.
-  // Neither mode waits on a capture callback or overwrites a full slot.
-  auto deadline = GetTickCount64() + (s.fake && !s.config.paceMs ? 1000 : 20);
+  // Dedicated worker only: tolerate a short consumer scheduling stall. The
+  // queue remains eight slots; no capture callback waits and no slot is lost.
+  auto deadline = GetTickCount64() + (s.fake && !s.config.paceMs ? 1000 : 200);
   while (get(s.output->write) - get(s.output->read) >= spatial_stream::slots && GetTickCount64() < deadline) {
     if (stopped(s)) return false;
     Sleep(1);
@@ -322,7 +333,7 @@ process(Session &s, HANDLE timer, int64_t &next, bool &started, uint32_t phase, 
   if (!publish(*s.output, b, data)) {
     auto why = get(s.output->error);
     fail(*s.input, why ? why : codec);
-    return false;
+    return failed(s, Failure::outputPublish);
   }
   ++o.records;
   o.outputBytes += b.bytes;
@@ -382,8 +393,8 @@ codecWorker(void *opaque) {
   Slot *prepared {};
   ActiveObject active[20] {};
   uint32_t activeCount = 0, nextSource = 0;
-  bool warmed = false, started = false;
-  int64_t next = 0;
+  bool warmed = false;
+  EncoderClock clock;
   if (s.fake) {
     s.target = &s;
     s.submit = fakeSubmit;
@@ -397,13 +408,13 @@ codecWorker(void *opaque) {
     BYTE *audio {};
     o.createHr = hostGuard(&audio) ? E_ACCESSDENIED : nativeOpen(s, audio);
   }
-  if (o.createHr != S_OK || o.initializeHr != S_OK) goto done;
+  if (o.createHr != S_OK || o.initializeHr != S_OK) { failed(s, Failure::initialize); goto done; }
   timer = CreateWaitableTimerExW(nullptr, nullptr, 0x2, TIMER_ALL_ACCESS);
-  if (!timer) goto done;
+  if (!timer) { failed(s, Failure::timer); goto done; }
   {
     local = new (std::nothrow) Slot;
     prepared = new (std::nothrow) Slot;
-    if (!local || !prepared) goto done;
+    if (!local || !prepared) { failed(s, Failure::allocation); goto done; }
     for (;;) {
       if (stopped(s)) break;
       auto r = get(s.read), w = get(s.write);
@@ -415,11 +426,14 @@ codecWorker(void *opaque) {
       put(s.read, r + 1);
       SetEvent(s.space);
       auto &m = local->header;
-      if (m.index != nextSource || (s.args.maxSourceRounds && m.index > s.args.maxSourceRounds) || !validCalls(*local, active, activeCount)) break;
+      o.failedSource = m.index;
+      if (m.index != nextSource) { failed(s, Failure::sourceSequence); break; }
+      if (s.args.maxSourceRounds && m.index > s.args.maxSourceRounds) { failed(s, Failure::sourceLimit); break; }
+      if (!validCalls(*local, active, activeCount)) { failed(s, Failure::objectContract); break; }
       bool first = false;
       if (!warmed && m.calls && m.kind == 1) {
         for (uint32_t j = 0; j < m.calls; ++j)
-          if (local->calls[j].flags != createFlags(local->calls[j].type)) goto stop;
+          if (local->calls[j].flags != createFlags(local->calls[j].type)) { failed(s, Failure::warmCreate); goto stop; }
         for (uint32_t n = 0; n < 20; ++n) {
           for (uint32_t j = 0; j < m.calls; ++j) {
             auto &c = prepared->calls[j];
@@ -428,7 +442,7 @@ codecWorker(void *opaque) {
             c.flags = n ? updateFlags(c.type) : createFlags(c.type);
             if (!submit(s, c)) goto stop;
           }
-          if (!process(s, timer, next, started, 1, UINT32_MAX)) goto stop;
+          if (!process(s, timer, clock, 1, UINT32_MAX)) goto stop;
         }
         warmed = true;
         first = true;
@@ -446,11 +460,16 @@ codecWorker(void *opaque) {
         o.eofSeen = 1;
         auto drain = drainCount(o.processes, s.fake);
         for (uint32_t n = 0; n < drain; ++n)
-          if (!process(s, timer, next, started, 3, UINT32_MAX)) goto stop;
+          if (!process(s, timer, clock, 3, UINT32_MAX)) goto stop;
         okay = true;
         break;
       }
-      if (nextSource >= UINT32_MAX - 100 || (s.args.maxSourceRounds && nextSource >= s.args.maxSourceRounds) || !process(s, timer, next, started, 2, nextSource++)) break;
+      if (nextSource >= UINT32_MAX - 100) { failed(s, Failure::sourceCounter); break; }
+      if (s.args.maxSourceRounds && nextSource >= s.args.maxSourceRounds) { failed(s, Failure::sourceLimit); break; }
+      if (m.firstQpc <= 0 || m.lastQpc < m.firstQpc) { failed(s, Failure::captureClock); break; }
+      if (!o.sourceFirstQpc) o.sourceFirstQpc = m.firstQpc;
+      o.sourceLastQpc = m.firstQpc;
+      if (!process(s, timer, clock, 2, nextSource++, m.firstQpc)) break;
     }
   stop:;
   }

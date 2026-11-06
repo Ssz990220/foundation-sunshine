@@ -19,7 +19,7 @@ objects and 7.1.4 static channels, with at most 20 complete inputs in total.
 Static channels keep their AudioObjectType, including LFE; no XYZ is invented.
 Unsupported static types, multiple sources for one bed channel (mixing is not
 implemented), fragmented objects, other rates, missing inputs and multiple active renderers fail the session. No
-resampling, inferred silence, catch-up or sample-file input is provided.
+resampling, inferred silence, discarded input or sample-file input is provided.
 
 A paired successful plugin Process can return buffered headphone output with no
 object Submit. Such output-only drains do not create MAT object input, advance
@@ -93,3 +93,56 @@ unfinished ticket. QPC ordering is checked per domain, not across independent
 threads. No callback waits, allocations or silent drops are introduced.
 Only one object-bearing domain is encoded. The private capture IPC is version 5;
 rebuild the tap and publisher together. This does not change the MAT wire protocol.
+
+### Long-session timing and fault diagnostics
+
+The dedicated codec worker uses absolute 100 Hz deadlines during warmup and
+drain, including fractional QPC ticks. Source processing follows observed
+capture timestamps with a 20 ms lead. Scheduling lateness never rebases
+the current clock.
+Only the dedicated output workers may wait for space: the existing eight-slot
+encoded ring and four-cycle pipe queue remain bounded, with 200 ms wait budgets.
+A codec more than 250 ms behind its steady deadline ends the epoch. Initial
+pre-roll may catch up losslessly from at most 500 ms behind and must settle
+within two seconds; a source is not advertised ready before it catches up.
+Capture callbacks
+remain nonblocking; source samples and carrier cycles are never discarded or
+replayed to catch up. Reconnects retain their fresh PLAY timestamp cutoff.
+
+`NATIVE_DIAGNOSTICS` records the first worker failure stage, source index,
+last Process byte count, maximum scheduling lateness, and QPC frequency.
+Stage values follow `spatial_stream::Failure` in `stream_output_protocol.h`:
+0 none, 1 initialize, 2 timer, 3 allocation, 4 source sequence, 5 object contract,
+6 warm-create, 7 submit, 8 scheduling lateness, 9 Process result, 10 Process byte count,
+11 output publish, 12 source limit, 13 source counter, 14 capture clock,
+15 interrupted wait. The external error 13
+remains the generic `receiver::codec`; it is not a vendor HRESULT or proof of
+unsupported audio. Consumer exceptions are logged immediately as
+`NATIVE_CONSUMER_FAILURE`, and the first publisher error survives cancellation.
+The worker IPC version is 5; rebuild/deploy the publisher and worker together.
+The external Foundation-to-TV MAT wire format is unchanged.
+
+Silent regressions include 24 accelerated hours of clock jitter, a 90-second
+real-time own-process fake-codec run with 7.1.4 bed plus two dynamic objects and
+120 ms consumer pauses, finite backpressure, lease replacement, exact PCM/object
+transcripts and clean EOF. Fault injection distinguishes initialize, submit,
+Process result/size, and invalid object state failures despite generic error 13.
+These tests do not load Dolby binaries, attach to audiodg, select an audio
+endpoint, or emit audio. Passing them does not establish long native gaming or
+TV playback stability; that requires a later explicitly started live session.
+
+The live queue-full case additionally requires controller-side admission waits:
+`enqueue_native_wait` retains the exact packet for at most 200ms while allowing
+cancellation/faults to stop immediately. The realtime tap never waits. Both the
+production controller and IPC integration fixture use this same admission path.
+Warmup/drain remain nominal 100Hz; source processing follows observed capture
+QPC timestamps with a 20 ms lead, so device/QPC clock drift does not
+accumulate in the input queues. The worker ABI is now version 5, with first/last
+source capture timestamps for drift diagnostics. Protected deployment DLL names
+include both their content hash and the publisher hash to support pinned releases
+side by side without changing existing hash, path or ACL guards.
+
+`NATIVE_LIVE` samples approximate input age and bounded input/output/pipe queue
+depths every five seconds. These counters do not measure vendor codec delay,
+Sonos acoustic latency, or a calibrated A/V offset. Maximum scheduling lateness
+excludes intentional startup pre-roll catch-up, but retains any failed deadline.

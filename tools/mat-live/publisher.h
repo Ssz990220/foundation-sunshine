@@ -78,9 +78,23 @@ Qpc() {
 static void
 Broken(Shared &s, const char *message) {
   std::lock_guard lock(s.mutex);
+  if (!s.failed) s.error = message;
   s.failed = true;
-  s.error = message;
   s.queue.clear();
+  s.changed.notify_all();
+}
+// Called by a dedicated output consumer, never the Windows render callback.
+static void
+QueueLiveCycle(Shared &s, Cycle cycle) {
+  std::unique_lock lock(s.mutex);
+  if (!s.playing || cycle.qpc < s.play_qpc) return;
+  const auto space = s.changed.wait_for(lock, std::chrono::milliseconds(200), [&] {
+    return s.queue.size() < 4 || s.failed || !s.playing;
+  });
+  require(space && !s.failed, "Live consumer stalled beyond 200ms; no drop/replay");
+  // A lease can disappear or be replaced while this worker was waiting.
+  if (!s.playing || cycle.qpc < s.play_qpc) return;
+  s.queue.push_back(std::move(cycle));
   s.changed.notify_all();
 }
 static uintptr_t
@@ -224,6 +238,7 @@ Serve(Shared &shared, const std::wstring &name, mat_capture::Descriptor descript
             else {
               cycle = std::move(shared.queue.front());
               shared.queue.pop_front();
+              shared.changed.notify_all();
             }
           }
           uint8_t record[mat_capture::record_bytes];
@@ -257,6 +272,7 @@ Serve(Shared &shared, const std::wstring &name, mat_capture::Descriptor descript
         std::lock_guard lock(shared.mutex);
         shared.playing = false;
         shared.queue.clear();
+        shared.changed.notify_all();
       }
       CancelIoEx(pipe, nullptr);
       DisconnectNamedPipe(pipe);

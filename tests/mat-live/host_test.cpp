@@ -20,7 +20,7 @@ Carrier() {
   memcpy(b.data(), "\x72\xf8\x1f\x4e\x16\x00\x02\x00", 8);
   return b;
 }
-struct TestSource final: spatial_audio::EncodedAudioSource {
+struct TestSource: spatial_audio::EncodedAudioSource {
   int n = 0, limit = 8, stops = 0;
   bool fail = false, stopped = false, started = false, start_ok = true, pending = false;
   std::chrono::milliseconds period { 0 };
@@ -179,7 +179,7 @@ HostContracts() {
     if (scenario < 2) Check(error.find("mock source unavailable") != std::string::npos);
     if (scenario == 3 || scenario == 4 || scenario >= 12) Check(!raw->started && client.packets == 0);
   }
-  // Cancel during pacing, including a pending read, without manufacturing END.
+  // Cancel during packet handoff or a pending read, without manufacturing END.
   for (bool pending : { false, true }) {
     spatial_transport::LiveSession session;
     session.profile = { 400, 1 };
@@ -190,12 +190,55 @@ HostContracts() {
     MockClient client(session.profile, key);
     bool cancelled = false, caught = false;
     try {
-      spatial_transport::live_session(session, key, 16, [&](auto *p, auto n) { client.push(p, n); }, [&](auto) { cancelled = true; }, [&] { return cancelled; });
+      spatial_transport::live_session(session, key, 16, [&](auto *p, auto n) {
+        client.push(p, n); if (!pending && client.packets >= 8) cancelled = true;
+      }, [&](auto) { cancelled = true; }, [&] { return cancelled; });
     }
     catch (...) {
       caught = true;
     }
     Check(caught && raw->stops == 1 && client.ends == 0);
+  }
+  // An already available cycle requires no second media/fragment clock.
+  {
+    spatial_transport::LiveSession session;
+    session.profile = { 510, 1 };
+    auto source = std::make_unique<TestSource>();
+    source->limit = 50;
+    session.source = std::move(source);
+    MockClient client(session.profile, key);
+    spatial_transport::live_session(session, key, 16,
+      [&](auto *p, auto n) { client.push(p, n); },
+      [](auto) { throw std::runtime_error("unexpected fragment pacing wait"); }, [] { return false; });
+    Check(client.received == 50 && client.ends == 1);
+  }
+  // A real capture clock continues while the sender runs. Two milliseconds
+  // of per-cycle handoff overhead must not turn into permanent pacing debt.
+  {
+    struct QueuedSource final: TestSource {
+      std::chrono::steady_clock::time_point epoch;
+      bool start() override { epoch = std::chrono::steady_clock::now(); return TestSource::start(); }
+      spatial_audio::Read read(spatial_audio::Frame &f) override {
+        if (n == limit) return spatial_audio::Read::ended;
+        const auto due = epoch + std::chrono::milliseconds(n * 20);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < due) return spatial_audio::Read::pending;
+        spatial_audio::require(now - due < std::chrono::milliseconds(80), "mock capture queue backed up");
+        return TestSource::read(f);
+      }
+    };
+    spatial_transport::LiveSession session;
+    session.profile = { 511, 1 };
+    auto source = std::make_unique<QueuedSource>();
+    source->limit = 100;
+    session.source = std::move(source);
+    MockClient client(session.profile, key);
+    spatial_transport::live_session(session, key, 16, [&](auto *p, auto n) {
+      const auto before = client.received;
+      client.push(p, n);
+      if (client.received != before) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }, wait, [] { return false; });
+    Check(client.received == 100 && client.ends == 1);
   }
   // A source slower than the host clock must not accumulate pacing debt. At
   // 25ms per cycle a fixed 20ms schedule falls 60ms behind by cycle 13.

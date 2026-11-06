@@ -1,0 +1,173 @@
+name: Windows MAT low-delay test
+on:
+  push:
+    branches: [codex/mat-low-delay]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mat-low-delay-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+      BRANCH: codex/mat-low-delay
+      BUILD_VERSION: v2026.1106.000001.mat-test
+      COMMIT: ${{ github.sha }}
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.longpaths
+          GIT_CONFIG_VALUE_0: 'true'
+
+      - name: Setup Dependencies Windows
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          # Required, not redundant with the `pacman -Syu` below. When
+          # msys2-runtime itself needs upgrading, pacman closes every MSYS2
+          # process to finish the job, which kills the workflow shell and fails
+          # the step with exit 1. setup-msys2 performs that upgrade with the
+          # restart it needs; by the time our own step runs, the runtime is
+          # already current and only the dependency list is left to install.
+          update: true
+          install: >-
+            wget
+            curl
+
+      - name: Update Windows dependencies
+        env:
+          opus_version: '1.6.1-1'
+        shell: msys2 {0}
+        run: |
+          # download pinned opus version
+          opus_tarball="mingw-w64-ucrt-x86_64-opus-${opus_version}-any.pkg.tar.zst"
+          wget https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
+
+          # install dependencies
+          # NOTE: gcc/gcc-libs were previously pinned to 15.1.0-5 to work around
+          # a broken upstream gcc 15.x. Since msys2 has moved on to gcc 16.x and
+          # other packages (cmake, etc.) now require gcc-libs 16.x ABI, pinning
+          # an old gcc-libs causes cmake.exe to silently fail to load (exit 127).
+          # Let pacman install the full toolchain at the current upstream version.
+          dependencies=(
+            "git"
+            "mingw-w64-ucrt-x86_64-ccache"
+            "mingw-w64-ucrt-x86_64-cmake"
+            "mingw-w64-ucrt-x86_64-lld"
+            "mingw-w64-ucrt-x86_64-ninja"
+            "mingw-w64-ucrt-x86_64-cppwinrt"
+            "mingw-w64-ucrt-x86_64-curl-winssl"
+            "mingw-w64-ucrt-x86_64-graphviz"
+            "mingw-w64-ucrt-x86_64-MinHook"
+            "mingw-w64-ucrt-x86_64-miniupnpc"
+            "mingw-w64-ucrt-x86_64-nlohmann-json"
+            # "mingw-w64-ucrt-x86_64-nodejs"  # Replaced by actions/setup-node (vite 8 requires MSVC Node.js)
+            # "mingw-w64-ucrt-x86_64-nsis"  # Replaced by Inno Setup
+            "mingw-w64-ucrt-x86_64-onevpl"
+            "mingw-w64-ucrt-x86_64-openssl"
+            "mingw-w64-ucrt-x86_64-toolchain"
+            "mingw-w64-ucrt-x86_64-autotools"
+          )
+
+          pacman -Syu --noconfirm "${dependencies[@]}"
+
+          # install pinned opus after Syu to prevent upgrade
+          pacman --noconfirm -U ${opus_tarball}
+
+      - name: Verify Build Tools
+        shell: msys2 {0}
+        run: |
+          echo "Verifying build tools are installed..."
+          which cmake || (echo "cmake not found" && exit 1)
+          which ninja || (echo "ninja not found" && exit 1)
+          which gcc || (echo "gcc not found" && exit 1)
+          
+          echo "All build tools verified successfully"
+          echo "  CMake: $(cmake --version | head -1)"
+          echo "  Ninja: $(ninja --version)"
+          echo "  GCC: $(gcc --version | head -1)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup .NET for DualSense sidecar
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build self-contained DualSense sidecar
+        shell: pwsh
+        env:
+          RELEASE_TAG: v2026.1106.000001.mat-test
+        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RELEASE_TAG
+
+      - name: Build Web UI
+        shell: pwsh
+        run: |
+          npm ci
+          npm run lint:webui
+          npm run test:webui
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
+          $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
+          npm run build
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: mat-ucrt-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: mat-ucrt-${{ runner.os }}-
+      - name: Configure isolated test host
+        shell: msys2 {0}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          cmake -B build -G Ninja -S . \
+            -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON \
+            -DBUILD_WEB_UI=OFF -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_RTX_HDR=OFF -DDRIVER_DEPS_REQUIRED=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSUNSHINE_PUBLISHER_NAME=Ssz990220 \
+            -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/Ssz990220/foundation-sunshine \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/Ssz990220/foundation-sunshine/issues
+      - name: Compile test host
+        shell: msys2 {0}
+        run: ninja -C build
+      - name: Run native regressions
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: mat-ucrt-${{ runner.os }}-${{ github.run_id }}
+      - name: Stage portable app files only
+        shell: msys2 {0}
+        run: cmake --install build --prefix mat-staging
+      - name: Record test artifact provenance
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem mat-staging -File -Recurse | ForEach-Object {
+            @{ path = [IO.Path]::GetRelativePath((Resolve-Path mat-staging), $_.FullName); sha256 = (Get-FileHash $_.FullName).Hash.ToLower() }
+          })
+          @{ commit = '${{ github.sha }}'; installed = $false; nativeTestsPassed = $true; scope = 'Source-paced MAT sender; no service, driver, TV or plugin installation'; files = $files } | ConvertTo-Json -Depth 5 | Set-Content mat-staging/mat-test-provenance.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foundation-mat-low-delay-${{ github.sha }}
+          path: mat-staging/**

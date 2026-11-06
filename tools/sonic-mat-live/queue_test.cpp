@@ -13,8 +13,10 @@ Check(bool b) {
 int
 wmain(int argc, wchar_t **argv) {
   try {
-    Check(argc == 2 || (argc == 3 && std::wstring(argv[2]) == L"--bed-7.1.4"));
+    Check(argc == 2 || (argc == 3 && (std::wstring(argv[2]) == L"--bed-7.1.4" || std::wstring(argv[2]) == L"--paced-stress")));
+    const bool paced = argc == 3 && std::wstring(argv[2]) == L"--paced-stress";
     const bool bed = argc == 3;
+    const unsigned rounds = paced ? 9000 : 1300;
     const unsigned lanes = bed ? 14u : 1u;
     auto type = [&](unsigned n) { return bed && n < 12 ? 1u << (n + 1) : 1u; };
     HANDLE inputMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(receiver::Shared), nullptr);
@@ -33,14 +35,14 @@ wmain(int argc, wchar_t **argv) {
     Check(dll != nullptr);
     auto start = (spatial_stream::FakeStart) GetProcAddress(dll, "TestMatStreamReceiverFake");
     Check(start != nullptr);
-    spatial_stream::FakeConfig config { sizeof(config), spatial_stream::streamVersion, 0, -1, -1, 0, 0 };
+    spatial_stream::FakeConfig config { sizeof(config), spatial_stream::streamVersion, 0, -1, -1, 0, paced ? 10u : 0u };
     std::atomic<DWORD> result = STILL_ACTIVE;
     std::thread worker([&] { result = start(&args, &config); });
     std::atomic<bool> failed = false;
     uint64_t blocks = 0, source = 0;
     std::string error;
     std::thread reader([&] {try{
-        auto slot=std::make_unique<spatial_stream::OutputSlot>();auto deadline=GetTickCount64()+15000;
+        auto slot=std::make_unique<spatial_stream::OutputSlot>();auto deadline=GetTickCount64()+(paced?105000:15000);
         for(;;){Check(GetTickCount64()<deadline);auto status=spatial_stream::next(*output,*slot,blocks);
             if(status==spatial_stream::Poll::pending){Sleep(1);continue;}Check(status!=spatial_stream::Poll::failed);if(status==spatial_stream::Poll::ended)break;
             auto& b=slot->header;Check(b.format==spatial_stream::fakeFormat&&b.sampleStart==blocks*480);uint32_t phase,index,count;memcpy(&phase,slot->payload,4);memcpy(&index,slot->payload+4,4);memcpy(&count,slot->payload+8,4);
@@ -49,7 +51,9 @@ wmain(int argc, wchar_t **argv) {
                     float xyz[3];memcpy(xyz,p+8,12);Check(xyz[0]==(type(n)==1?float(source%100)/100.f:0.f)&&xyz[1]==0&&xyz[2]==0);
                     const float expected=(float(source%31)/100.f+float(n)*.01f)*(.3f*.5f);float pcm[480];memcpy(pcm,p+20,sizeof(pcm));for(auto f:pcm)Check(f==expected);}
                 ++source;
-            }++blocks;
+            }
+        if(paced && blocks % 500 == 499) Sleep(120);
+        ++blocks;
         }
     }catch(const std::exception& e){error=e.what();failed=true;SetEvent(cancel);} });
     sonic_live::PluginBridge bridge;
@@ -68,13 +72,18 @@ wmain(int argc, wchar_t **argv) {
     o.volume = .3f;
     o.gain = .5f;
     auto emit = [&](const receiver::Slot &packet) {Check(packet.header.calls==lanes);for(unsigned n=0;n<lanes;++n)Check(packet.calls[n].type==type(n));
-        auto until=GetTickCount64()+2000;while(!sonic_live::enqueue_native(*input,packet,data)){
-        if(failed||receiver::get(input->common.fault)||GetTickCount64()>=until)return false;Sleep(1);
-    }return true; };
+        return sonic_live::enqueue_native_wait(*input,packet,data);
+     };
     try {
-      for (unsigned n = 0; n < 1300; ++n) {
+      const auto began = receiver::qpc(), hz = receiver::hz();
+      for (unsigned n = 0; n < rounds; ++n) {
+        const auto nominal = int64_t(n / 100) * hz + int64_t(n % 100) * hz / 100;
+        const auto due = began + nominal - nominal * 4000 / 1000000;
+        if (paced) {
+          while(receiver::qpc() < due) { receiver::put(input->writer.heartbeat, receiver::qpc()); Sleep(1); }
+        }
         pass->sequence = n;
-        pass->firstQpc = receiver::qpc();
+        pass->firstQpc = paced ? due : receiver::qpc();
         pass->lastQpc = pass->firstQpc;
         o.xyz[0] = float(n % 100) / 100.f;
         for (auto &f : o.pcm) f = float(n % 31) / 100.f;
@@ -115,8 +124,9 @@ wmain(int argc, wchar_t **argv) {
     }
     worker.join();
     reader.join();
-    Check(!failed && result == 0 && source == 1300 && blocks == 1350 && bridge.outputOnlyPasses() == 36 && output->header.eofSeen && output->header.fakeCallsVerified == 1321 * lanes && output->header.sourceSamples == 1300 * 480 * lanes && output->header.vendorLoads == 0 && output->header.hostGuardPassed == 0);
-    std::cout << "PASS object bridge -> actual IPC FAKE codec worker: lanes=" << lanes << ", 1300 source rounds, 36 output-only drains, 1350 output blocks, owned type/PCM/XYZ/gain exact; nativeCapture=0\n";
+    Check(!failed && result == 0 && source == rounds && blocks == rounds + 50 && bridge.outputOnlyPasses() == (rounds + 36)/37 && output->header.eofSeen && output->header.fakeCallsVerified == (rounds+21) * lanes && output->header.sourceSamples == uint64_t(rounds) * 480 * lanes && output->header.vendorLoads == 0 && output->header.hostGuardPassed == 0);
+    Check(output->header.failure == spatial_stream::Failure::none && output->header.localHighWater <= 8);
+    std::cout << "PASS rounds=" << rounds << " paced=" << paced << " maxLateMs=" << double(output->header.maximumLatenessQpc)*1000/receiver::hz() << " object bridge -> actual IPC FAKE codec worker: lanes=" << lanes << ", owned type/PCM/XYZ/gain exact, consecutive blocks and complete EOS; nativeCapture=0\n";
     FreeLibrary(dll);
     UnmapViewOfFile(input);
     UnmapViewOfFile(output);

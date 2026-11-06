@@ -313,6 +313,24 @@ int
 main() {
   try {
     StartupFailureCleanup();
+    {
+      Shared s; s.playing = true; s.play_qpc = 1;
+      Cycle c {}; c.qpc = 1;
+      for (unsigned n=0;n<4;++n) { c.bytes[0]=BYTE(n); QueueLiveCycle(s,c); }
+      std::thread consumer([&] { Sleep(120); std::lock_guard lock(s.mutex);
+        CheckPipe(s.queue.size()==4 && s.queue.front().bytes[0]==0,"Bounded queue order");
+        s.queue.pop_front(); s.changed.notify_all(); });
+      c.bytes[0]=4; QueueLiveCycle(s,c); consumer.join();
+      CheckPipe(s.queue.size()==4 && s.queue.front().bytes[0]==1 && s.queue.back().bytes[0]==4,"Short stall lost/reordered carrier");
+      bool refused=false; try { QueueLiveCycle(s,c); } catch(...) { refused=true; }
+      CheckPipe(refused && s.queue.size()==4,"Permanent stall did not fail closed");
+      std::thread replacement([&] { Sleep(30); std::lock_guard lock(s.mutex);
+        s.queue.clear(); s.play_qpc=2; s.changed.notify_all(); });
+      QueueLiveCycle(s,c); replacement.join();
+      CheckPipe(s.queue.empty(),"Prior lease carrier escaped PLAY cutoff");
+      Broken(s,"original consumer reason"); Broken(s,"later generic cancellation");
+      CheckPipe(s.failed && s.error=="original consumer reason","Original failure overwritten");
+    }
     const fs::path programs = L"C:\\Program Files";
     const std::string hash(64, 'a');
     const auto installed = programs / L"SunshineSonicMatLive" / hash / L"sunshine-plugin-mat-capture.exe";

@@ -57,11 +57,17 @@ class NativeSession {
   uint64_t domain_, epoch_;
   const char *sourceKind_;
   bool finished_ = false, reported_ = false;
+  uint64_t waitedPushes_ = 0;
+  DWORD maximumInputWaitMs_ = 0;
+  uint64_t nextLiveReport_ = 0;
   void
   report() {
     if (!output_ || reported_) return;
     reported_ = true;
     const auto &s = output_->header;
+    printf("NATIVE_INPUT_QUEUE waitedPushes=%llu maximumWaitMs=%lu\n", waitedPushes_, maximumInputWaitMs_);
+    printf("NATIVE_SOURCE_CLOCK firstQpc=%lld lastQpc=%lld rounds=%llu qpcHz=%lld\n", s.sourceFirstQpc, s.sourceLastQpc, s.sourceRounds, receiver::hz());
+    printf("NATIVE_DIAGNOSTICS stage=%u source=%u produced=%u maxLateQpc=%lld qpcHz=%lld\n", unsigned(s.failure), s.failedSource, s.lastProduced, s.maximumLatenessQpc, receiver::hz());
     printf("NATIVE_WORKER sourceRounds=%llu sourceSamples=%llu processes=%llu outputBytes=%llu warm=%llu drain=%llu status=%ld error=%ld vendorLoads=%llu activations=%llu initialize=%llu createHR=0x%08x mapperHR=0x%08x initializeHR=0x%08x submitHR=0x%08x processHR=0x%08x\n", s.sourceRounds, s.sourceSamples, s.processes, s.outputBytes, s.warmRounds, s.drainRounds, s.status, s.error, s.vendorLoads, s.activations, s.initializations, (unsigned) s.createHr, (unsigned) s.mapperHr, (unsigned) s.initializeHr, (unsigned) s.submitHr, (unsigned) s.processHr);
   }
   void
@@ -90,24 +96,27 @@ class NativeSession {
         auto qpc = source.capture_qpc();
         require(qpc > 0, "Native MAT completion clock");
         progress = GetTickCount64();
-        std::lock_guard lock(pipe_.mutex);
-        bool first = !pipe_.ready;
-        pipe_.ready = true;
+        std::unique_lock lock(pipe_.mutex);
+        const auto lastInput = InterlockedCompareExchange64(
+          reinterpret_cast<volatile LONG64 *>(&output_->header.sourceLastQpc), 0, 0);
+        const bool caughtUp = lastInput > 0 && receiver::qpc() - lastInput <= receiver::hz() * 3 / 100;
+        bool first = !pipe_.ready && caughtUp;
+        // Pre-roll carriers are private to the encoder. Advertise a live
+        // source only after input processing has caught up to its 20ms lead.
+        pipe_.ready = pipe_.ready || caughtUp;
         pipe_.encoder = domain_;
         pipe_.last_cycle = progress;
         ++pipe_.cycles;
         if (first) printf("NATIVE_MAT_READY source=%s carrierBytes=61440 inputRenderer=0x%llx fileInput=0\n", sourceKind_, domain_);
-        if (pipe_.playing && qpc >= pipe_.play_qpc) {
-          require(pipe_.queue.size() < 4, "Live consumer overflow; no drop/replay");
-          Cycle cycle {};
-          memcpy(cycle.bytes.data(), frame.bytes.data(), frame.bytes.size());
-          cycle.qpc = qpc;
-          pipe_.queue.push_back(std::move(cycle));
-          pipe_.changed.notify_all();
-        }
+        lock.unlock();
+        Cycle cycle {};
+        memcpy(cycle.bytes.data(), frame.bytes.data(), frame.bytes.size());
+        cycle.qpc = qpc;
+        QueueLiveCycle(pipe_, std::move(cycle));
       }
     }
     catch (const std::exception &e) {
+      fprintf(stderr, "NATIVE_CONSUMER_FAILURE %s\n", e.what());
       Broken(pipe_, e.what());
       if (input_) receiver::fail(*input_, receiver::codec);
       if (cancel_) SetEvent(cancel_);
@@ -166,14 +175,38 @@ public:
   ~NativeSession() { cleanup(); }
   bool
   send(const receiver::Slot &packet) {
-    bool accepted = sonic_live::enqueue_native(*input_, packet, data_);
+    DWORD waited = 0;
+    bool accepted = sonic_live::enqueue_native_wait(*input_, packet, data_, 200, &waited);
+    if (waited) ++waitedPushes_;
+    if (waited > maximumInputWaitMs_) maximumInputWaitMs_ = waited;
     if (!accepted) fprintf(stderr, "NATIVE_INPUT_REFUSED fault=%ld cancel=%ld done=%ld queued=%lld capacity=32 workerStatus=%ld workerError=%ld\n",
       receiver::get(input_->common.fault), receiver::get(input_->common.cancel), receiver::get(input_->common.producerDone),
       receiver::get(input_->writer.write) - receiver::get(input_->reader.read), receiver::get(output_->header.status), receiver::get(output_->header.error));
     return accepted;
   }
   void
-  heartbeat() { receiver::put(input_->writer.heartbeat, receiver::qpc()); }
+  heartbeat() {
+    const auto nowQpc = receiver::qpc();
+    receiver::put(input_->writer.heartbeat, nowQpc);
+    const auto tick = GetTickCount64();
+    if (tick < nextLiveReport_ || !output_->header.sourceLastQpc) return;
+    nextLiveReport_ = tick + 5000;
+    // Approximate in-flight queue age, not codec or acoustic latency. Metadata
+    // only, from the controller thread; the realtime capture tap is unchanged.
+    size_t pipeQueued;
+    bool playing;
+    uint64_t cycles;
+    {
+      std::lock_guard lock(pipe_.mutex);
+      pipeQueued = pipe_.queue.size(); playing = pipe_.playing; cycles = pipe_.cycles;
+    }
+    const auto &s = output_->header;
+    printf("NATIVE_LIVE sourceAgeMs=%lld inputQueued=%lld encodedQueued=%lld pipeQueued=%zu playing=%u sourceRounds=%llu cycles=%llu workerMaxLateMs=%lld\n",
+      (nowQpc - s.sourceLastQpc) * 1000 / receiver::hz(),
+      receiver::get(input_->writer.write) - receiver::get(input_->reader.read),
+      receiver::get(output_->write) - receiver::get(output_->read), pipeQueued, unsigned(playing),
+      s.sourceRounds, cycles, s.maximumLatenessQpc * 1000 / receiver::hz());
+  }
   void
   finish() {
     auto until = GetTickCount64() + 2000;

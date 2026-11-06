@@ -52,4 +52,23 @@ namespace sonic_live {
     SetEvent(data);
     return true;
   }
+  // Controller thread only, never a realtime Windows render callback. A full
+  // ring is temporary backpressure; retain this exact packet until admission.
+  inline bool
+  enqueue_native_wait(receiver::Shared &input, const receiver::Slot &packet, HANDLE data,
+                      DWORD budgetMs = 200, DWORD *waitedMs = nullptr) {
+    const auto began = GetTickCount64();
+    for (;;) {
+      if (enqueue_native(input, packet, data)) {
+        if (waitedMs) *waitedMs = DWORD(GetTickCount64() - began);
+        return true;
+      }
+      if (receiver::get(input.common.fault) || receiver::get(input.common.cancel) ||
+          receiver::get(input.common.producerDone) || GetTickCount64() - began >= budgetMs) {
+        if (waitedMs) *waitedMs = DWORD(GetTickCount64() - began);
+        return false;
+      }
+      Sleep(1);
+    }
+  }
 }  // namespace sonic_live

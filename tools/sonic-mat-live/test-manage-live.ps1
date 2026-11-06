@@ -76,6 +76,11 @@ Check-Status 'StoppedVerified'
 (& $control -Action Stop -Metadata "$out/capture.json")|Out-Null
 Set-Content -LiteralPath $state.captureLog -Value @('STOP cycles=0 failed=1 error=source-stall restored=1','HOOK_STOP restored=1 nativeStatus=2 nativeError=0 entries=6')
 Check-Status 'Faulted'
+$stopped=(& $control -Action Stop -Metadata "$out/capture.json")|ConvertFrom-Json
+if($stopped.state -ne 'Faulted' -or !$stopped.cleanupVerified){throw 'Faulted capture cleanup lost root state/restoration'}
+Set-Content -LiteralPath $state.captureLog -Value 'STOP cycles=0 failed=1 error=source-stall restored=0'
+$rejected=$false;try{& $control -Action Stop -Metadata "$out/capture.json"|Out-Null}catch{$rejected=$true}
+if(!$rejected){throw 'Missing restoration accepted for live engine'}
 Set-Content -LiteralPath $state.captureLog -Value @('COMPONENT name=audioeng.dll support=unsupported version=10.0.1.2 sha256=00','COMPONENT name=DolbyAccess support=missing version=unknown sha256=none','FAILED Unsupported system component; see COMPONENT lines win32=0')
 Check-Status 'Unsupported'
 $state.publisherPid=$PID;$state.publisherCreated=$current.StartTime.ToFileTimeUtc().ToString()
@@ -83,6 +88,8 @@ Set-Content -LiteralPath $state.captureLog -Value ''
 Check-Status 'WaitingForObjects'
 Set-Content -LiteralPath $state.captureLog -Value 'NATIVE_MAT_READY source=test-state-only'
 Check-Status 'NativeReady'
+$rejected=$false;try{& $control -Action Stop -Metadata "$out/capture.json"|Out-Null}catch{if($_.Exception.Message -notmatch 'Stop event missing for live pinned publisher'){throw};$rejected=$true}
+if(!$rejected){throw 'Missing live stop event was silently accepted'}
 $state.publisherCreated='1';Save-State
 $rejected=$false;try{& $control -Action Stop -Metadata "$out/capture.json"|Out-Null}catch{$rejected=$true}
 if(!$rejected){throw 'Changed process identity was accepted'}

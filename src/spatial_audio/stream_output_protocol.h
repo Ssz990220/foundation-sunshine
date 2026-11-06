@@ -4,8 +4,13 @@
 
 namespace spatial_stream {
   using namespace receiver;
-  constexpr uint32_t streamMagic = 0x32534f4d, streamVersion = 3, slots = 8, payloadCapacity = 12 + 64 * 1940;
+  constexpr uint32_t streamMagic = 0x32534f4d, streamVersion = 5, slots = 8, payloadCapacity = 12 + 64 * 1940;
   constexpr uint32_t nativeFormat = 1, fakeFormat = 0x80000001u;
+  enum class Failure : uint32_t {
+    none, initialize, timer, allocation, sourceSequence, objectContract,
+    warmCreate, submit, pace, processResult, processBytes, outputPublish,
+    sourceLimit, sourceCounter, captureClock, interruptedWait
+  };
   struct Stats {
     uint32_t magic, version, bytes, kind;
     volatile LONG status, error;
@@ -18,6 +23,10 @@ namespace spatial_stream {
     int32_t createHr, mapperHr, initializeHr, submitHr, processHr;
     uint64_t sourceSamples, fakeCallsVerified;
     uint32_t endpointCalls, hooksInstalled;
+    // First worker failure only. Never substitute a later cancellation for it.
+    Failure failure;
+    uint32_t failedSource, lastProduced;
+    int64_t maximumLatenessQpc, sourceFirstQpc, sourceLastQpc;
   };
 #pragma pack(push, 1)
   struct Block {
